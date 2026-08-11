@@ -207,9 +207,12 @@ def extract_hiera_features(video_path, model, device, batch_size=8):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", type=str, required=True, help="Path to input .mp4 video file")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained MULDE neural network (.pt)")
-    parser.add_argument("--stats", type=str, required=True, help="Path to training train_feature_stats.npz")
-    parser.add_argument("--gmm", type=str, required=True, help="Path to trained GMM model (.joblib)")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained MULDE neural network (.pt)")
+    parser.add_argument("--stats", type=str, default=None, help="Path to training train_feature_stats.npz")
+    parser.add_argument("--gmm", type=str, default=None, help="Path to trained GMM model (.joblib)")
+    parser.add_argument("--features", type=str, default=None, help="Load cached Hiera-L features from an NPZ file instead of extracting them")
+    parser.add_argument("--save_features", type=str, default=None, help="Save extracted Hiera-L features and video metadata to this NPZ file")
+    parser.add_argument("--extract_features_only", action="store_true", help="Extract Hiera-L features, save them with --save_features, and stop before MULDE scoring")
     parser.add_argument("--output_dir", type=str, default="output_results", help="Directory to save output files")
     parser.add_argument("--smooth_sigma", type=float, default=15.0, help="Sigma for temporal Gaussian smoothing")
     parser.add_argument(
@@ -257,13 +260,50 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.extract_features_only:
+        if not args.save_features:
+            parser.error("--extract_features_only requires --save_features")
+    elif not all([args.checkpoint, args.stats, args.gmm]):
+        parser.error("inference requires --checkpoint, --stats, and --gmm")
+
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Hiera Feature Extraction
-    hiera_model = load_hiera_extractor(device)
-    features, num_frames, fps = extract_hiera_features(args.video, hiera_model, device)
-    print(f"Features extracted: {features.shape} at {fps:.2f} FPS")
+    # 1. Load cached Hiera-L features or extract them once from the video.
+    if args.features:
+        feature_path = Path(args.features)
+        if not feature_path.exists():
+            raise FileNotFoundError(f"Cached feature file does not exist: {feature_path}")
+        print(f"Loading cached Hiera-L features from: {feature_path}")
+        with np.load(feature_path, allow_pickle=False) as cached:
+            features = cached["features"].astype(np.float32, copy=False)
+            num_frames = int(cached["num_frames"])
+            fps = float(cached["fps"])
+        if features.shape[0] != num_frames:
+            raise ValueError(
+                f"Cached feature count {features.shape[0]} does not match num_frames={num_frames}"
+            )
+        print(f"Cached features loaded: {features.shape} at {fps:.3f} FPS")
+    else:
+        hiera_model = load_hiera_extractor(device)
+        features, num_frames, fps = extract_hiera_features(args.video, hiera_model, device)
+        print(f"Features extracted: {features.shape} at {fps:.2f} FPS")
+
+    if args.save_features:
+        feature_path = Path(args.save_features)
+        feature_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            feature_path,
+            features=features.astype(np.float32, copy=False),
+            frame_indices=np.arange(num_frames, dtype=np.int64),
+            num_frames=np.asarray(num_frames, dtype=np.int64),
+            fps=np.asarray(fps, dtype=np.float64),
+        )
+        print(f"Saved Hiera-L feature cache: {feature_path}")
+
+    if args.extract_features_only:
+        print("Feature extraction completed; MULDE scoring was skipped.")
+        return
 
     # 2. Standardization
     print(f"Loading feature standardization stats from: {args.stats}")
