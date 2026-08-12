@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 """
-Run MULDE Anomaly Detection on a Custom MP4 Video
--------------------------------------------------
-This script runs the entire MULDE inference pipeline on a single custom .mp4 video file:
+Run MULDE Anomaly Detection on a Custom Video or Image Folder
+-------------------------------------------------------------
+This script runs the entire MULDE inference pipeline on a custom video file or a
+naturally sorted folder of image frames:
 1. Loads the pretrained Hiera-L model from PyTorch Hub (head set to Identity).
-2. Decodes and preprocesses the video frames (falls back to OpenCV if decord fails).
+2. Decodes video frames or loads and preprocesses image frames (with OpenCV).
 3. Extracts spatiotemporal features (1152-dim) in batches.
 4. Standardizes features using training stats (mean/std).
 5. Computes the 16-dimensional multiscale log-density signature using the trained MLP.
@@ -20,6 +21,7 @@ import sys
 import gc
 import argparse
 import subprocess
+import re
 import numpy as np
 from pathlib import Path
 import torch
@@ -67,6 +69,53 @@ def load_hiera_extractor(device):
     model = model.to(device)
     model.eval()
     return model
+
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")
+
+
+def natural_keys(text):
+    """Sort names numerically so frame_10 comes after frame_2."""
+    return [int(chunk) if chunk.isdigit() else chunk.lower()
+            for chunk in re.split(r"(\d+)", str(text))]
+
+
+def list_image_frames(image_dir):
+    """Return supported image files in natural frame order."""
+    image_dir = Path(image_dir)
+    frame_paths = sorted(
+        [path for path in image_dir.iterdir()
+         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS],
+        key=lambda path: natural_keys(path.name),
+    )
+    if not frame_paths:
+        raise FileNotFoundError(
+            f"No supported image frames found in directory: {image_dir}"
+        )
+    return frame_paths
+
+
+def preprocess_all_frames_from_images(frame_paths, target_size=(224, 224)):
+    """Load, resize, RGB-convert, and normalize an ordered image sequence."""
+    mean = np.array([0.45, 0.45, 0.45], dtype=np.float32).reshape(1, 3, 1, 1)
+    std = np.array([0.225, 0.225, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+    all_frames = np.empty(
+        (len(frame_paths), 3, target_size[0], target_size[1]),
+        dtype=np.float32,
+    )
+
+    for index, frame_path in enumerate(frame_paths):
+        image_bgr = cv2.imread(str(frame_path))
+        if image_bgr is None:
+            raise ValueError(f"Failed to read image frame: {frame_path}")
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        image_resized = cv2.resize(
+            image_rgb, target_size, interpolation=cv2.INTER_LINEAR
+        )
+        image_float = image_resized.astype(np.float32) / 255.0
+        all_frames[index] = image_float.transpose(2, 0, 1)
+
+    return (all_frames - mean) / std
 
 
 def preprocess_all_frames_decord(vr, num_frames, target_size=(224, 224), chunk_size=128):
@@ -127,10 +176,70 @@ def generate_clip_indices(i, num_frames):
     return np.array(indices, dtype=np.int64)
 
 
-def extract_hiera_features(video_path, model, device, batch_size=8):
+def _extract_features_from_cached_frames(cached_frames, num_frames, fps, model, device, batch_size=8):
+    """Run the shared batched Hiera inference on already-preprocessed frames."""
+    gc.collect()
+
+    print("Running Hiera-L batched feature extraction...")
+    frame_indices = np.arange(num_frames, dtype=np.int64)
+    clip_indices = np.zeros((num_frames, 16), dtype=np.int64)
+    for i in range(num_frames):
+        clip_indices[i] = generate_clip_indices(i, num_frames)
+
+    features_list = []
+    current_batch_size = batch_size
+    success = False
+
+    while not success and current_batch_size >= 1:
+        try:
+            features_list = []
+            for batch_start in range(0, num_frames, current_batch_size):
+                batch_end = min(batch_start + current_batch_size, num_frames)
+                batch_clips = []
+                for i in range(batch_start, batch_end):
+                    clip_frames = cached_frames[clip_indices[i]]
+                    clip_tensor = torch.from_numpy(clip_frames.copy()).permute(1, 0, 2, 3)
+                    batch_clips.append(clip_tensor)
+
+                stacked = torch.stack(batch_clips, dim=0).to(device)
+                with torch.no_grad():
+                    with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+                        feats = model(stacked)
+                    features_list.append(feats.float().cpu().numpy())
+                del stacked
+            features = np.concatenate(features_list, axis=0)
+            success = True
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"[WARNING] OOM with batch={current_batch_size}. Halving and retrying...")
+                current_batch_size //= 2
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if current_batch_size < 1:
+                    raise e
+            else:
+                raise e
+
+    del cached_frames
+    gc.collect()
+    return features, num_frames, fps
+
+
+def extract_hiera_features(video_path, model, device, batch_size=8, fps_override=None):
     """Run Hiera-L batched inference to extract 1152-dim features."""
-    print(f"Decoding video: {video_path}...")
-    
+    print(f"Reading input: {video_path}...")
+
+    if os.path.isdir(video_path):
+        frame_paths = list_image_frames(video_path)
+        num_frames = len(frame_paths)
+        fps = float(fps_override) if fps_override is not None else 24.0
+        print(f"Pre-caching {num_frames} image frames (natural order)...")
+        cached_frames = preprocess_all_frames_from_images(frame_paths)
+        return _extract_features_from_cached_frames(
+            cached_frames, num_frames, fps, model, device, batch_size
+        )
+
     use_decord = True
     try:
         vr = VideoReader(video_path, ctx=cpu(0))
@@ -206,7 +315,8 @@ def extract_hiera_features(video_path, model, device, batch_size=8):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video", type=str, required=True, help="Path to input .mp4 video file")
+    parser.add_argument("--video", type=str, required=True, help="Path to an input video file or a folder of image frames")
+    parser.add_argument("--fps", type=float, default=None, help="FPS for an image folder (defaults to 24.0, matching the Hiera extraction notebook)")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained MULDE neural network (.pt)")
     parser.add_argument("--stats", type=str, default=None, help="Path to training train_feature_stats.npz")
     parser.add_argument("--gmm", type=str, default=None, help="Path to trained GMM model (.joblib)")
@@ -286,7 +396,9 @@ def main():
         print(f"Cached features loaded: {features.shape} at {fps:.3f} FPS")
     else:
         hiera_model = load_hiera_extractor(device)
-        features, num_frames, fps = extract_hiera_features(args.video, hiera_model, device)
+        features, num_frames, fps = extract_hiera_features(
+            args.video, hiera_model, device, fps_override=args.fps
+        )
         print(f"Features extracted: {features.shape} at {fps:.2f} FPS")
 
     if args.save_features:
