@@ -113,7 +113,7 @@ PRISM repository).
 | PRISM (fusion) | Both | 89.9% | 83% |
 
 When fused with the pose stream in PRISM, the combined system achieves
-**89.3% Micro AUC on ShanghaiTech** (+9.7 pp over MULDE alone) and
+**89.9% Micro AUC on ShanghaiTech** (+10.2 pp over MULDE alone) and
 **83% on Avenue** (+1.6 pp). The appearance stream is particularly
 important on Avenue where the pose stream underperforms.
 
