@@ -109,12 +109,12 @@ PRISM repository).
 | Method | Stream | ShanghaiTech (Micro AUC) | Avenue (Micro AUC) |
 | :-- | :-- | ---: | ---: |
 | **MULDE** | Appearance | **79.7%** | **81.4%** |
-| STG-NF | Pose | 84% | 57.0% |
-| PRISM (fusion) | Both | 89.9% | 82.8% |
+| STG-NF | Pose | 83.9% | 57.0% |
+| PRISM (fusion) | Both | 89.9% | 83% |
 
 When fused with the pose stream in PRISM, the combined system achieves
-**89.9% Micro AUC on ShanghaiTech** (+5.8 pp over MULDE alone) and
-**82.8% on Avenue** (+1.4 pp). The appearance stream is particularly
+**89.3% Micro AUC on ShanghaiTech** (+9.7 pp over MULDE alone) and
+**83% on Avenue** (+1.6 pp). The appearance stream is particularly
 important on Avenue where the pose stream underperforms.
 
 ---
